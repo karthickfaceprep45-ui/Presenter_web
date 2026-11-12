@@ -233,18 +233,28 @@ function listenForClassStart(roomCode) {
 
   const sendJoinAndRequest = () => {
     if (!studentWaitingRealtime) return
-    studentWaitingRealtime.publish('student-join', {
-      name: studentDisplayName.value,
-      studentId: studentId.value
-    })
-    studentWaitingRealtime.publish('request-state', {
-      name: studentDisplayName.value,
-      studentId: studentId.value
-    })
+    if (studentDisplayName.value) {
+      studentWaitingRealtime.publish('student-join', {
+        name: studentDisplayName.value,
+        studentId: studentId.value
+      })
+    } else {
+      studentWaitingRealtime.publish('request-state', {
+        name: 'Student',
+        studentId: studentId.value
+      })
+    }
   }
 
   studentWaitingRealtime.on('class-start', (data) => {
     if (!data || data.senderRole !== 'mentor') return
+    initialClassroomState.value = {
+      senderRole: 'mentor',
+      mentorId: data.mentorId,
+      isClassLive: true,
+      isClassEnded: false,
+      currentStepIndex: 0
+    }
     cleanupWaitingRealtime()
     view.value = 'classroom'
   })

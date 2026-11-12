@@ -9,9 +9,15 @@
 
 import Pusher from 'pusher-js'
 
-const PUSHER_MAX_SAFE_PAYLOAD = 7000
-const PUSHER_CHUNK_SIZE = 6500
+const PUSHER_MAX_SAFE_BYTES = 8500
+const PUSHER_INITIAL_CHUNK_CHARS = 5500
 const CHUNK_EVENT_NAME = '__chunk'
+const utf8Encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null
+
+function utf8ByteLength(str) {
+  if (!str) return 0
+  return utf8Encoder ? utf8Encoder.encode(str).length : str.length * 2
+}
 
 export class RealtimeService {
   constructor(roomCode) {
@@ -47,7 +53,7 @@ export class RealtimeService {
     // Initialize Pusher if key is provided
     if (this.hasPusherConfigured()) {
       const pusherKey = import.meta.env.VITE_PUSHER_KEY.trim()
-      const pusherCluster = import.meta.env.VITE_PUSHER_CLUSTER || 'mt1'
+      const pusherCluster = (import.meta.env.VITE_PUSHER_CLUSTER || 'mt1').trim()
       this.initPusher(pusherKey, pusherCluster)
     } else {
       console.info(`[Realtime] Running in local BroadcastChannel mode for room: ${this.roomCode} (Add VITE_PUSHER_KEY for remote sync)`)
@@ -65,7 +71,7 @@ export class RealtimeService {
   initPusher(key, cluster) {
     try {
       this.pusherClient = new Pusher(key, {
-        cluster: cluster || 'mt1',
+        cluster: (cluster || 'mt1').trim(),
         forceTLS: true,
       })
 
@@ -78,12 +84,24 @@ export class RealtimeService {
         if (isReconnect) {
           this.wasDisconnected = false
         }
+        console.info(`[Realtime] Subscribed via Pusher (${cluster}) to channel: ${this.channelName}`)
         this.emitSubscribed({ isReconnect })
+      })
+
+      this.channel.bind('pusher:subscription_error', (err) => {
+        console.error(`[Realtime] Pusher subscription error on ${this.channelName}:`, err)
+      })
+
+      this.pusherClient.connection.bind('error', (err) => {
+        console.error('[Realtime] Pusher connection error:', err)
       })
 
       this.pusherClient.connection.bind('state_change', (states) => {
         if (!states) return
-        if (states.current === 'unavailable' || states.current === 'disconnected') {
+        if (states.current === 'unavailable' || states.current === 'disconnected' || states.current === 'failed') {
+          if (states.current === 'failed') {
+            console.error('[Realtime] Pusher connection failed. Check VITE_PUSHER_KEY and VITE_PUSHER_CLUSTER.')
+          }
           if (this.hasCompletedInitialSubscribe) {
             this.wasDisconnected = true
           }
@@ -102,8 +120,6 @@ export class RealtimeService {
         if (event.startsWith('pusher:')) return
         this.handleIncomingEvent(event, data)
       })
-
-      console.info(`[Realtime] Connected via Pusher to channel: ${this.channelName}`)
     } catch (err) {
       console.warn('[Realtime] Failed to initialize Pusher, using BroadcastChannel:', err)
     }
@@ -250,38 +266,69 @@ export class RealtimeService {
     }
   }
 
+  splitJsonForPusherChunks(serialized, chunkId, event) {
+    const parts = []
+    let cursor = 0
+    while (cursor < serialized.length) {
+      let len = Math.min(PUSHER_INITIAL_CHUNK_CHARS, serialized.length - cursor)
+      while (len > 1) {
+        const candidate = serialized.slice(cursor, cursor + len)
+        const probe = JSON.stringify({
+          id: chunkId,
+          event,
+          index: parts.length,
+          total: parts.length + 100,
+          part: candidate
+        })
+        if (utf8ByteLength(probe) <= PUSHER_MAX_SAFE_BYTES) break
+        len = Math.max(1, Math.floor(len * 0.7))
+      }
+      parts.push(serialized.slice(cursor, cursor + len))
+      cursor += len
+    }
+    return parts
+  }
+
+  async postTrigger(event, data) {
+    const res = await fetch('/api/pusher/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel: this.channelName,
+        event,
+        data
+      })
+    })
+    const result = await res.json().catch(() => null)
+    if (!res.ok || !result || result.success !== true) {
+      const reason = result?.error || result?.warning || `HTTP ${res.status} (expected JSON { success: true })`
+      console.warn(`[Realtime] Pusher trigger failed for "${event}":`, reason)
+      return false
+    }
+    return true
+  }
+
   async sendPusherTrigger(event, data) {
     try {
       const serialized = JSON.stringify(data)
-      if (serialized.length <= PUSHER_MAX_SAFE_PAYLOAD) {
-        const res = await fetch('/api/pusher/trigger', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            channel: this.channelName,
-            event,
-            data
-          })
-        })
-        if (!res.ok) return
+      if (utf8ByteLength(serialized) <= PUSHER_MAX_SAFE_BYTES) {
+        await this.postTrigger(event, data)
         return
       }
 
       const chunkId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
-      const total = Math.ceil(serialized.length / PUSHER_CHUNK_SIZE)
+      const parts = this.splitJsonForPusherChunks(serialized, chunkId, event)
+      const total = parts.length
       for (let i = 0; i < total; i++) {
         if (this.isDestroyed) return
-        const part = serialized.slice(i * PUSHER_CHUNK_SIZE, (i + 1) * PUSHER_CHUNK_SIZE)
-        const res = await fetch('/api/pusher/trigger', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            channel: this.channelName,
-            event: CHUNK_EVENT_NAME,
-            data: { id: chunkId, event, index: i, total, part }
-          })
+        const ok = await this.postTrigger(CHUNK_EVENT_NAME, {
+          id: chunkId,
+          event,
+          index: i,
+          total,
+          part: parts[i]
         })
-        if (!res.ok) return
+        if (!ok) return
       }
     } catch (err) {
       console.warn('[Realtime] Pusher trigger network warning:', err.message)

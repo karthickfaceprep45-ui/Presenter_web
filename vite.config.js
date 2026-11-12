@@ -42,10 +42,10 @@ export default defineConfig(({ mode }) => {
                   res.setHeader('Content-Type', 'application/json')
                   res.end(JSON.stringify({ success: true }))
                 } catch (err) {
-                  console.error('[Pusher Dev Trigger Error]', err.message)
+                  console.error('[Pusher Dev Trigger Error]', err?.status || '', err?.message || err, err?.body || '')
                   res.statusCode = 500
                   res.setHeader('Content-Type', 'application/json')
-                  res.end(JSON.stringify({ error: err.message }))
+                  res.end(JSON.stringify({ error: err?.message || 'Pusher trigger failed' }))
                 }
               })
               return
